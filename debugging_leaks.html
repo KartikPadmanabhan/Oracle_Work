@@ -179,13 +179,13 @@ The next bit of output shows you the report results after the procedure call had
 			---------------- ---------------- ---------------- ----------------
 				 498,885,505      598,850,293                0    1,225,374,453
 ```
- The session has allocated – and is still holding – more than 488MB in the PL/SQL category just because of that one million row insert. (My client was processing 3.8 million rows, and they "lost" 7.7GB of memory to this operation – the memory loss gives the appearance of growing geometrically with the number of rows).
+ The session has allocated and is still holding more than 488MB in the PL/SQL category just because of that one million row insert. (My client was processing 3.8 million rows, and they "lost" 7.7GB of memory to this operation the memory loss gives the appearance of growing geometrically with the number of rows).
 
 In fact the penalty is more than that 488MB; the memory that had been allocated for the bulk collect in category "Other" has been released and the 110MB still remaining in that categiry is also a side effect of the forall insert.
 
 Note, by the way, that the pga_max_mem from v$process_memory is still 313M higher than it should be, as is the max_allocated in the "Other" category in v\$process_memory.
 
-So if your code does very large "forall insert" calls and you see Oracle error ORA-04030 from time to time, or workarea operations dumping to disc unexpectedly, you may temporarily be losing large amounts of memory to this bug – in which case check Metalink for the bug number and see if there's a patch that's good for your platform. (And if you're on 10.2.0.3 or 10.2.0.4 and there isn't a patch for your platform yet, there's a reasonable chance you can get one created since it's already been done on a couple of other platforms.)
+So if your code does very large "forall insert" calls and you see Oracle error ORA-04030 from time to time, or workarea operations dumping to disc unexpectedly, you may temporarily be losing large amounts of memory to this bug in which case check Metalink for the bug number and see if there's a patch that's good for your platform. (And if you're on 10.2.0.3 or 10.2.0.4 and there isn't a patch for your platform yet, there's a reasonable chance you can get one created since it's already been done on a couple of other platforms.)
 
 I am also summarizing below a list of cases where I have seen memory leak in the past and the way I have approached the problem.
 
