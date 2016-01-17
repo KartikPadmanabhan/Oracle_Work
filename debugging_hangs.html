@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html>
+<title> DEBUGGING KERNEL HANGS AND DEADLOCKS IN ORACLE RDBMS </title>
+
+<xmp theme="chaltin" style="display:none;">
+
+
+#### Author: Kartik Padmanabhan, Architect, Oracle USA Inc
+
+This material is aimed for DBA's and kernel engineers working with Oracle RDBMS who are interested in hang infrastructure of Oracle Database. The focus of discussion of this discussion will be on 12c hang infrastructure, however its applicable to older releases as well.
+
+## Basic Hang Analysis Architecture
+
+This section contains details on the basic oracle architecture that is required to triage Oracle
+instance hangs.
+ 
+### Hang Analysis Dump Intro:
+
+Hang analysis is an oracle dump used to determine why the instance is hung. It outputs which sessions are blocking other sessions based on hang analysis callbacks implemented by the resource layer owners. The hang analysis output contains the current wait, current sql, short stack, and wait history for each interesting session. Uninteresting sessions like idle sessions are automatically skipped.
+
+
+### Identifying Foregrounds Processes:
+
+When you determine that oratst is waiting for sqlplus sessions or oci clients to complete, the first thing to do is find the OSID's of the oracle processes executing the client sql so that you can check if the oracle processes are spinning, blocked, etc.
+
+There are two primary mechanisms by which clients can execute sql in oracle processes: dedicated server and shared server. In the dedicated server model there is a process, known as a foreground, that executes the sql. In the shared server model there is a pool of background processes that execute the sql.
+
+Identifying dedicated servers:
+
+* In the ps output search for processes with names like "oracle?(LOCAL=?)". In the example below processes 19804, 19806, and 19808 are all foregrounds.
+
+```
+					-- ps output --
+					aime3 19781 1 0 12:22 ? 00:00:01 ora_cjq0_aime3
+					aime3 19785 1 0 12:22 ? 00:00:00 ora_q000_aime3
+					aime3 19787 1 0 12:22 ? 00:00:00 ora_q001_aime3
+					aime3 19804 1 0 12:22 ? 00:00:00 oracleaime3
+					(DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=beq)))
+					aime3 19806 1 0 12:22 ? 00:00:00 oracleaime3
+					(DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=beq)))
+					aime3 19808 1 0 12:22 ? 00:00:00 oracleaime3
+					(DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=beq)))
+```
+
+* In the hang analysis output search for processes with name " oracle@? (TNS?)"
+
+```
+					os id: 19804
+					process id: 23, oracle@stawn11 (TNS V1-V3)
+					os id: 19808
+					process id: 25, oracle@stawn11 (TNS V1-V3)
+```
+
+* Backgrounds in the ps output for database instances are identified by "ora_<4 letter background name>_<oracle_sid>". For ASM instances they are identified by "asm_<4 letter background name>_<oracle_sid>". In the example below processes 20785 and 20787 are shared servers.
+
+```
+					-- ps output --
+					aime3 19781 1 0 12:22 ? 00:00:01 ora_cjq0_aime3
+					aime3 20785 1 0 12:22 ? 00:00:00 ora_s000_aime3
+					aime3 20787 1 0 12:22 ? 00:00:00 ora_s001_aime3
+```
+
+* In hang analysis the background name is in parenthesis.
+
+```
+					os id: 20785
+					process id: 30, oracle@stahi16 (S000)
+```
+
+### Identifying SQL Statements that are hung:
+
+There are tons are tools in the market that shows us the list of SQL statements that are currently executed in the system. If none of the tools are available for DBA's use, please look at the currently active sessions in the V$SQL view.
+
+Here is an example of the SQL that's hung on a real customer use-case.
+
+```
+					cw5z8q8v50fhr          2 select distinct how from audit_ng$ where policy# = :1
+					5f4b0juhwp62t/2       17 insert /*+ append */ into sys.ora_temp_1_ds_40002 SELECT /*+
+											 parallel(t,16) parallel_index(t,16) dbms_stats cursor_sharing_exact
+											 use_weak_name_resl dynamic_sampling(0) no_monitoring xmlindex_sel_idx_tbl
+											 no_substrb_pad
+											 */"INVOICE_DATE","DELIVERY_ADDRESS_ID","GL_POSTING_DATE","ITEM_NUMBER","DEL
+											 IVERY_ROUTE_NUMBER", rowid SYS_DS_ALIAS_0  from "WHLOAD"."KW_SALESFACTS"
+											 sample (   .0038554395)  t  UNION ALL SELECT  "INVOICE_DATE",
+											 "DELIVERY_ADDRESS_ID", "GL_POSTING_DATE", "ITEM_NUMBER",
+											 "DELIVERY_ROUTE_NUMBER", SYS_DS_ALIAS_0 FROM sys.ora_temp_1_ds_40002 WHERE
+											 1 = 0
+					4qdgkz2tb1y3d/2        6 insert /*+ append */ into sys.ora_temp_1_ds_40004 SELECT /*+
+											 parallel(t,240) parallel_index(t,240) dbms_stats cursor_sharing_exact
+											 use_weak_name_resl dynamic_sampling(0) no_monitoring xmlindex_sel_idx_tbl
+											 no_substrb_pad
+											 */"INVOICE_DATE","DELIVERY_ADDRESS_ID","GL_POSTING_DATE","ITEM_NUMBER","DEL
+											 IVERY_ROUTE_NUMBER", rowid SYS_DS_ALIAS_0  from "WHLOAD"."KW_SALESFACTS"
+											 sample (   .0038554395)  t  UNION ALL SELECT  "INVOICE_DATE",
+											 "DELIVERY_ADDRESS_ID", "GL_POSTING_DATE", "ITEM_NUMBER",
+											 "DELIVERY_ROUTE_NUMBER", SYS_DS_ALIAS_0 FROM sys.ora_temp_1_ds_40004 WHERE
+											 1 = 0
+
+```
+
+### Hang Analysis Dump Details:
+
+Every wait that an oracle process can enter is demarcated with an Oracle wait event. There is a	text string that is associated with every wait event and serves as its name/text identifier. Waits that represent one Oracle session waiting for another should ideally have a hang analysis
+callback defined by the wait event owner. The hang analysis callback allows us to display the blocker of an Oracle session in the hang analysis dump.
+
+```
+					Oracle session identified by:
+					{
+					instance: 1 (aime3.aime3)
+					os id: 19804
+					process id: 23, oracle@stawn11 (TNS V1-V3)
+					session id: 92
+					session serial #: 7
+					}
+					is waiting for 'enq: UL - contention' with wait info:
+					{
+					p1: 'name|mode'=0x554c0004
+					p2: 'id'=0x4
+					p3: '0'=0x0
+					time in wait: 68 mins
+					timeout after: never
+					wait id: 136
+					blocking: 0 sessions
+					current sql: BEGIN sync.wait; END;
+					short stack: ...
+					wait history: ...
+					}
+					and is blocked by
+					=> Oracle session identified by:
+					{
+					instance: 1 (aime3.aime3)
+					os id: 19808
+					process id: 25, oracle@stawn11 (TNS V1-V3)
+					session id: 89
+					session serial #: 1
+					}
+					which is waiting for 'enq: UL - contention' with wait info:
+					{
+					p1: 'name|mode'=0x554c0006
+					p2: 'id'=0x3
+					p3: '0'=0x0
+					time in wait: 68 mins
+					timeout after: never
+					wait id: 151
+					blocking: 1 session
+					current sql: BEGIN sync.wait; END;
+					short stack: ...
+					wait history: ...
+					}
+					and is blocked by
+					=> Oracle session identified by
+					{
+					instance: 1 (aime3.aime3)
+					os id: 19806
+					process id: 24, oracle@stawn11 (TNS V1-V3)
+					session id: 93
+					session serial #: 8
+					}
+					which is waiting for 'Streams AQ: waiting for messages in the queue' with wait info:
+					{
+					p1: 'queue id'=0xeb75
+					p2: 'process#'=0x2a1da3b8
+					p3: 'wait time'=0x7fffffff
+					time in wait: 0.894231 secs
+					heur. time in wait: 83.118140 secs
+					timeout after: 9.105769 secs
+					wait id: 609
+					blocking: 2 sessions
+					current sql: BEGIN tkaq_navdeq('APP1_Q2DEF'); END;
+					short stack: <-ksedsts()+286<-ksdxfstk()+22<-ksdxcb()+1560<-sspuser()+102<-
+					semtimedop()+36<-sskgpwwait()+286<-skgpwwait()+142<-ksliwat()+1587<-kslwaitctx()+97<-
+					kslwait()+703<-kwqidexfcy()+3010<-kwqidsc80i()+1170<-kwqidrdq()+1092<-kwqidsfmp()+592<-
+					kwqidafm0()+5693<-kwqididqx()+5429<-kwqidxdeq0()+1924<-kwqidxdeq102.()+763<-
+					kwqiadtdeq()+795<-spefcmpa()+438<-spefmccallstd()+453<-pextproc()+183<-peftrusted()+170<-
+					psdexsp()+556<-rpiswu2.()+1186<-psdextp()+868<-pefccal()+580<-pefcal()+893<-
+					pevm_FCAL.()+60<-pfrinstr_FCAL()+76<-pfrrun_
+					wait history:
+					1. event: 'Streams AQ: waiting for messages in the queue'
+					wait id: 608 p1: 'queue id'=0xeb75
+					time waited: 2.197861 secs p2: 'process#'=0x2a1da3b8
+					p3: 'wait time'=0x7fffffff
+					2. event: 'Streams AQ: waiting for messages in the queue'
+					wait id: 607 p1: 'queue id'=0xeb75
+					time waited: 10.002149 secs p2: 'process#'=0x2a1da3b8
+					p3: 'wait time'=0x7fffffff
+					3. event: 'Streams AQ: waiting for messages in the queue'
+					wait id: 606 p1: 'queue id'=0xeb75
+					time waited: 10.003058 secs p2: 'process#'=0x2a1da3b8
+					p3: 'wait time'=0x7fffffff
+					}
+```
+
+In the hang analysis output below the wait event name for the wait that process 23 is in is 'enq:	UL - contention'. Process 23 is blocked by process 25. Process 25 is also waiting with wait event 'enq: UL - contention'. Process 25 is blocked by process 24. Process 24 is waiting with wait event 'Streams AQ: waiting for messages in the queue'.
+
+Take a moment to familiarize yourself with the information exposed in the hang analysis output. This output includes the current sql, short stack, current wait information, and wait history. With regards to the current wait information see the "time in wait" and "timeout after" values for the 'enq: UL - contention' waits and the 'Streams AQ: waiting for messages in the queue' wait.
+
+For both the 'enq: UL - contention' waits we see the "time in wait" as being 68 minutes with a timeout value of "never". Indicating that the sessions are going to wait as long as it takes to get the enqueue:
+
+```
+					time in wait: 68 mins
+					timeout after: never
+```
+
+For the 'Streams AQ: waiting for messages in the queue' wait we see that the time in wait is a	small value. Furthermore there is also a field called "heuristic time in wait" which is a slightly	larger value. The "heuristic time in wait" is computed by using the heuristic that if the wait event,	wait parameter 1 (p1), wait parameter 2 (p2), and wait parameter 3 (p3) are the same for back-to back	waits, then the wait is	really for the same resource. Therefore the "heuristic time in wait" is	the time that the wait event, p1, p2, and p3 have been the same for back-to-back waits. This heuristic was introduced since not all waits have switched to the 11gr1 wait API. With the old wait API there was ambiguity if a wait was part of the same resource wait vs. if the resource wait completed, the resource was released, and then the resource was requested for again.
+
+Note that just because the time in wait is a small value it does not necessarily mean that the final	blocker is not stuck. The final blocking session can be performing different waits periodically but	still not make any progress.
+
+Regarding the format of the hang analysis output, if you remove everything between the braces	the hang analysis output is structured like an English sentence. So the way you would read the	above output is as follows:
+
+```
+					Oracle session identified by {}
+					is waiting for 'enq: UL - contention' with wait info {}
+					and is blocked by
+					=> Oracle session identified by {}
+					which is waiting for 'enq: UL - contention' with wait info {}
+					and is blocked by
+					=> Oracle session identified by {}
+					which is waiting for 'Streams AQ: waiting for messages in the queue' with wait info
+```
+
+#### Dilling Down Statedump
+
+Here is an example where the SQL from the statements insert into a temporary table from  "WHLOAD"."KW_SALESFACTS". KW_Salesfacts table has approx 142M rows. These rpi insert calls are performed by  OSPIDs (28410, 28412, 123274 etc) as we can see in hanganalyze file /u01/app/oracle/diag/rdbms/sr122/SR1221/trace/SR1221_ora_90221.trc. All of these belongs to PX slave processes.
+Statedump /u01/app/oracle/diag/rdbms/sr122/SR1221/trace/SR1221_ora_98860.trc shows all of these slaves are waiting on the following stack.
+
+```
+					PROCESS 227: P02P
+					Short stack dump:
+					ksedsts()+918<-ksdxcb()+1827<-sspuser()+311<-__sighandler(<-kxfqfprFastPackRow()+1423<-kxfqenq()+4408
+					<-qertqoRop()+2174<-qeruaRowProcedure()+817<-kdstf000110100000001km()+2923<-kdsttgr()+6499
+					<-qertbFetch()+17902<-qergiFetch()+4552<-rwsfcd()+134<-qeruaFetch()+434<-qertqoFetch()+3197
+					<-qerpxSlaveFetch()+12122<-qerpxFetch()+13905<-insdlexe()+1473<-insExecStmtExecIniEngine()+76
+					<-insexe()+916<-opiexe()+15093<-kpoal8()+4259<-opiodr()+3278<-kpoodr()+713<-upirtrc()+2260
+					<-kpurcsc()+109<-kpuexec()+12442<-OCIStmtExecute()+41<-kxfxsStmtExecute()+703<-kxfxsExecute()+509
+					<-kxfxsp()+5251<-kxfxmai()+1333<-kxfprdp_int()+5186<-opirip()+2077<-opidrv()+925<-sou2o()+245
+					<-opimai_real()+739<-ssthrdmain()+506<-main()+262<-__libc_start_main()+253
+
+					PROCESS 242: P02O
+					ksedsts()+918<-ksdxcb()+1827<-sspuser()+311<-__sighandler()<-__poll()+24<-ipcgxp_selectex()+409<-ipclw_wait()+3148<-ksxpwait_ipclw()+4089<-ksxpwait()+23626
+					<-ksliwat()+3570<-kslwaitctx()+241<-kxfpqidqr()+5103<-kxfprienq()+2421<-kxfpqrenq()+1203
+					<-kxfqfprFastPackRow()+1232<-kxfqenq()+4408<-qertqoRop()+2174<-qeruaRowProcedure()+817
+					<-kdstf000110100000001km()+2923<-kdsttgr()+6570<-qertbFetch()+17902<-qergiFetch()+4552
+					<-rwsfcd()+134<-qeruaFetch()+434<-qertqoFetch()+3197<-qerpxSlaveFetch()+12122<-qerpxFetch()+13905
+					<-insdlexe()+1473<-insExecStmtExecIniEngine()+76<-insexe()+916<-opiexe()+15093<-kpoal8()+4259
+					<-opiodr()+3278<-kpoodr()+713<-upirtrc()+2260<-kpurcsc()+109<-kpuexec()+12442<-OCIStmtExecute()+41
+					<-kxfxsStmtExecute()+703<-kxfxsExecute()+509<-kxfxsp()+5251<-kxfxmai()+1333<-kxfprdp_int()+5186
+					<-opirip()+2077<-opidrv()+925<-sou2o()+245<-opimai_real()+739<-ssthrdmain()+506<-main()+262
+					<-__libc_start_main()+253
+
+```
+
+Looking at the stack, it looks either IPC, PQ or temp table are in grey region (I have marked the stack above in RED)
+
+
+#### LMD0 traces:
+
+In-case of any real deadlock, my usual first togo place is LMD traces. Sometimes based on my experience, LMD doesnt show much of info during which we drill down to statedump, but in this case we can clearly can nail down the culprit.
+
+This is a clear case of DEADLOCK with the following enqueue dump. I look at the following (RED) text at enqueue dumps to get more info on the deadlock. What it show from enqueue dump below is that gather stats is currently blocked by PX enqueue PS-00000001-0000009B-00000000-00000000 called from PX slave pid 28717 and that itself hasnt progressed in last 19642 secs. I really wish I had a pstack available on this machine else we could show a live stack to developer waiting on this.
+
+```
+----------enqueue 0x3ca32b1ce8------------------------
+lock version     : 705
+Owner inst       : 1
+grant_level      : KJUSERPR
+req_level        : KJUSERPR
+bast_level       : KJUSERNL
+notify_func      : none
+resp             : 0x7c8be92ac8
+procp            : 0x7ce7a7ed38
+pid              : 28717
+proc version     : 0
+oprocp           : (nil)
+opid             : 28717
+group lock owner : 0x3ca0c92f30
+possible pid     : 28717
+xid              : 11D000-0001-000002AD
+dd_time          : 0.0 secs
+dd_count         : 0
+timeout          : 0.0 secs
+On_timer_q?      : N
+On_dd_q?         : N
+sec since mv2grQ : 19642
+lock_state       : GRANTED
+ast_flag         : 0x0
+flags            : 0x1
+Open Options     : KJUSERDEADLOCK  KJUSERIDLK
+Convert options  : KJUSERGETVALUE KJUSERNODEADLOCKWAIT
+History          : NONE > NONE > NONE > NONE > NONE > NONE > NONE > NONE > NONE > REF_RES > LOC_AST
+Msg_Seq          : 0x0
+res_seq          : 317
+valblk           : 0x01ca2d00000000000000000000000000 .-
+user session for deadlock lock 0x3ca32b1ce8
+  sid: 6621 ser: 46411 audsid: 200051 user: 0/SYS
+    flags: (0x41) USR/- flags2: (0x40009) -/-/INC
+    flags_idl: (0x1) status: BSY/-/-/- kill: -/-/-/-
+  pid: 285 O/S info: user: oracle, term: UNKNOWN, ospid: 28717
+    image: oracle@scar06adm01.us.oracle.com (P04B)
+  client details:
+    O/S info: user: oracle, term: UNKNOWN, ospid: 28717
+    machine: scar06adm01.us.oracle.com program: oracle@scar06adm01.us.oracle.com (P04B)
+    application name: DBMS_SCHEDULER, hash value=2478762354
+    action name: ORA$AT_OS_OPT_SY_1, hash value=1714400945
+  current SQL:
+  insert /*+ append */ into sys.ora_temp_1_ds_40004 SELECT /*+  parallel(t,240) parallel_index(t,240) dbms_stats cursor_sharing_exact use_weak_name_resl dynamic_sampling(0) no_monitoring xmlindex_sel_idx_tbl no_substrb_pad  */"INVOICE_DATE","DELIVERY_ADDRESS_ID","GL_POSTING_DATE","ITEM_NUMBER","DELIVERY_ROUTE_NUMBER", rowid SYS_DS_ALIAS_0  from "WHLOAD"."KW_SALESFACTS" sample (   .0038554395)  t  UNION ALL SELECT  "INVOICE_DATE", "DELIVERY_ADDRESS_ID", "GL_POSTING_DATE", "ITEM_NUMBER", "DELIVERY_ROUTE_NUMBER", SYS_DS_ALIAS_0 FROM sys.ora_temp_1_ds_40004 WHERE 1 = 0
+DUMP LOCAL BLOCKER: initiate state dump for TIMEOUT
+
+  possible owner[285.28717] on resource PS-00000001-0000009B-00000000-00000000
+2015-08-28 03:41:20.150 :kjzddmp(): Submitting asynchronized dump request [1c]. summary=[ges process stack dump (kjdglblkrdm1)].
+
+
+Looking at the tracefile of the BLOCKER OSPID 28717 I notice the following messages:
+OSSIPC:SKGXP:[17541eb0.44]{0}: (28717 <- 10564)SKGXPDOAINVALCON: connection 0x175702d0 admno 0x1ce67482 scoono 0x69d865a6 acconn 0x4502eb72 getting closed. inactive: 0
+Backoff - 3, time increment - 60000
+OSSIPC:SKGXP:[17541eb0.55]{0}: (28717 <- 10460)SKGXPDOAINVALCON: connection 0x174c6480 admno 0x1ce67482 scoono 0x69d86598 acconn 0x435c8a22 getting closed. inactive: 1
+Backoff - 3, time increment - 60000
+OSSIPC:SKGXP:[17541eb0.66]{0}: (28717 <- 10530)SKGXPDOAINVALCON: connection 0x1755d290 admno 0x1ce67482 scoono 0x69d865a0 acconn 0x43890947 getting closed. inactive: 0
+Backoff - 3, time increment - 60000
+
+```
+
+This could be a PX deadlock as pointed above, or enqueue PS-00000001-0000009B-00000000-00000000 could timeout due to closed IPC Connections.
+
+Some Usecases:
+
+#### QUERY ON XT DEADLOCKED BY PX SLAVES CAUSING HIGH LATCH:CACHE BUFFERS WAITS 
+
+Here is a situation I have faced in the past where a with query is on wait for 9 + hours (query is operating on 50K row sales  table at a high concurrency). 
+
+```
+					 Oracle session identified by: 
+						 { 
+									 instance: 2 (slabex.slabex_2) 
+										os id: 11100 
+								   process id: 72, oracleslcab007 (P000) 
+								   session id: 11 
+							 session serial #: 25407 
+									   pdb id: 3 (PDB1) 
+						 } 
+						 is waiting for 'latch: cache buffers chains' with wait info: 
+						 { 
+										   p1: 'address'=0x68a4cb348 
+										   p2: 'number'=0x11a 
+										   p3: 'why'=0x1d8880 
+								 time in wait: 0.002513 sec 
+								timeout after: never 
+									  wait id: 25541635 
+									 blocking: 0 sessions 
+								  current sql: WITH T1 AS (SELECT /*+ materialize 
+					 parallel(sales,36) noparallel(customers) */ 
+									   prod_category, cust_city, cust_gender, sum(amount) 
+					 tot_amount 
+								   FROM sales, products, customers 
+								  WHERE sales.prod_id = products.prod_id 
+									AND sales.cust_id = customers.cust_id 
+					 . 
+								  short stack: 
+					 ksedsts()+449<-ksdxfstk()+58<-ksdxcb()+995<-sspuser()+270<-__sighandler()<-sem 
+					 op()+7<-skgpwwait()+200<-kslgess()+2802<-ksl_get_shared_latch_int()+3613<-kcbs 
+					 o1()+609<-kcbpsod()+2417<-kcbgtcr()+49173<-ktecgetsh()+2250<-ktecgshx()+33<-kt 
+					 einicnt1()+932<-qertbFetch()+2606<-qergiFetch()+551<-qervwFetch()+177<-qertqoF 
+					 etch()+885<-qerpxSlaveFetch()+5017<-qerpxFetch()+13420<-opiexe()+28946<-kpoal8 
+					 ()+2835<-opiodr()+1552<-kpoodr()+3445<-upirtrc()+2453<-kpurcsc()+102<-kpuexec( 
+					 )+11345<-OCIStmtExecute()+41<-kxfxsStmtExecute()+25 
+								 wait history: 
+								   * time between current wait and wait #1: 0.000014 sec 
+								   1.       event: 'cr request retry' 
+									  time waited: 0.000009 sec 
+										  wait id: 25541634         p1: 'file#'=0x304 
+																	p2: 'block#'=0x1d8880 
+								   * time between wait #1 and #2: 0.000100 sec 
+								   2.       event: 'latch: cache buffers chains' 
+									  time waited: 0.000034 sec 
+										  wait id: 25541633         p1: 'address'=0x68a4cb348 
+																	p2: 'number'=0x11a 
+																	p3: 'why'=0x1d8880 
+								   * time between wait #2 and #3: 0.000010 sec 
+								   3.       event: 'latch: cache buffers chains' 
+									  time waited: 0.000021 sec 
+										  wait id: 25541632         p1: 'address'=0x68a4cb348 
+																	p2: 'number'=0x11a 
+																	p3: 'why'=0x1d8880 
+						 } 
+						 and is blocked by 
+					  => Oracle session identified by: 
+						 { 
+									 instance: 2 (slabex.slabex_2) 
+										os id: 11190 
+								   process id: 109, oracleslcab007 (P00U) 
+								   session id: 1245 
+							 session serial #: 50785 
+									   pdb id: 3 (PDB1) 
+						 } 
+						 which is waiting for 'latch: cache buffers chains' with wait info: 
+						 { 
+										   p1: 'address'=0x68a4cb348 
+										   p2: 'number'=0x11a 
+										   p3: 'why'=0x0 
+								 time in wait: 0.004716 sec 
+								timeout after: never 
+									  wait id: 25471836 
+									 blocking: 5 sessions 
+								  current sql: WITH T1 AS (SELECT /*+ materialize 
+					 parallel(sales,36) noparallel(customers) */ 
+									   prod_category, cust_city, cust_gender, sum(amount) 
+					 tot_amount 
+								   FROM sales, products, customers 
+								  WHERE sales.prod_id = products.prod_id 
+									AND sales.cust_id = customers.cust_id 
+								  short stack: 
+					 ksedsts()+449<-ksdxfstk()+58<-ksdxcb()+995<-sspuser()+270<-__sighandler()<-sem 
+					 op()+7<-skgpwwait()+200<-kslgess()+2802<-ksl_get_shared_latch_int()+3613<-kclw 
+					 crs()+2039<-kclgclks()+3571<-kcbzib()+12743<-kcbgtcr()+46077<-ktecgetsh()+2250 
+					 <-ktecgshx()+33<-kteinmap0()+1315<-kteinmap()+24<-kdselget()+20<-kdstsne()+355 
+					 <-kdstsnb()+1460<-kdst_fetch0()+3305<-kdstf00001010000100km()+7984<-kdsttgr()+ 
+					 1590<-qertbFetch()+17552<-qergiFetch()+551<-qervwFetch()+177<-qertqoFetch()+88 
+					 5<-qerpxSlaveFetch()+5017<-qerpxFetch()+13420<-opie 
+								 wait history: 
+								   * time between current wait and wait #1: 0.000024 sec 
+								   1.       event: 'cr request retry' 
+									  time waited: 0.000006 sec 
+										  wait id: 25471835         p1: 'file#'=0x304 
+																	p2: 'block#'=0x1d8880 
+								   * time between wait #1 and #2: 0.000025 sec 
+								   2.       event: 'cr request retry' 
+									  time waited: 0.000005 sec 
+										  wait id: 25471834         p1: 'file#'=0x304 
+																	p2: 'block#'=0x1d8880 
+								   * time between wait #2 and #3: 0.000019 sec 
+								   3.       event: 'cr request retry' 
+									  time waited: 0.000006 sec 
+										  wait id: 25471833         p1: 'file#'=0x304 
+																	p2: 'block#'=0x1d8880 
+						 } 
+```
+
+
+  Both blocker and blocked slave PIDS from node 2 shows waiting on following 
+ stack and seem to differ in the place 
+ -ksl_get_shared_latch_int()+3613<-kcbso1() 
+ 
+ ```
+     PROCESS 72: P000 (blocked)   
+     Process Group: DEFAULT, pseudo proc: 0x694a547b0 
+         O/S info: user: kpadmana, term: UNKNOWN, ospid: 11100 
+         OSD pid info: 
+         Short stack dump: 
+     
+ ksedsts()+449<-ksdxfstk()+58<-ksdxcb()+995<-sspuser()+270<-__sighandler()<-sem 
+ op()+7<-skgpwwait()+200<-kslgess()+2802<-ksl_get_shared_latch_int()+3613<-kcbs 
+ o1()+609<-kcbpsod()+2417 
+     
+ <-kcbgtcr()+49173<-ktecgetsh()+2250<-ktecgshx()+33<-kteinicnt1()+932<-qertbFet 
+ ch()+2606<-qergiFetch()+551 
+     
+ <-qervwFetch()+177<-qertqoFetch()+885<-qerpxSlaveFetch()+5017<-qerpxFetch()+13 
+ 420<-opiexe()+28946<-kpoal8()+2835 
+     
+ <-opiodr()+1552<-kpoodr()+3445<-upirtrc()+2453<-kpurcsc()+102<-kpuexec()+11345 
+ <-OCIStmtExecute()+41 
+     
+ <-kxfxsStmtExecute()+255<-kxfxsExecute()+218<-kxfxsp()+821<-kxfxmai()+588<-kxf 
+ prdp()+1721<-opirip()+875<-opidrv()+666 
+     
+ <-sou2o()+130<-opimai_real()+189<-ssthrdmain()+412<-main()+262<-__libc_start_m 
+ ain() 
+ . 
+     PROCESS 109: P00U (final blocker) 
+           Waiter Link: [0x6949766d8,0x69ca36898] 
+         Process Group: DEFAULT, pseudo proc: 0x694a547b0 
+         O/S info: user: kpadmana, term: UNKNOWN, ospid: 11190 
+         OSD pid info: 
+         Short stack dump: 
+     
+ ksedsts()+449<-ksdxfstk()+58<-ksdxcb()+995<-sspuser()+270<-__sighandler()<-sem 
+ op()+7<-skgpwwait()+200<-kslgess()+2802<-kcbgtcr()+3668<-ktecgetsh()+2250<-kte 
+ cgshx()+33<-kteinmap0()+1315 
+     
+ <-kteinmap()+24<-kdselget()+20<-kdstsne()+355<-kdstsnb()+1460<-kdst_fetch0()+3 
+ 305<-kdstf00001010000100km()+7984 
+     
+ <-kdsttgr()+1590<-qertbFetch()+17552<-qergiFetch()+551<-qervwFetch()+177<-qert 
+ qoFetch()+885<-qerpxSlaveFetch()+5017 
+     
+ <-qerpxFetch()+13420<-opiexe()+28946<-kpoal8()+2835<-opiodr()+1552<-kpoodr()+3 
+ 445<-upirtrc()+2453<-kpurcsc()+102 
+     
+ <-kpuexec()+11345<-OCIStmtExecute()+41<-kxfxsStmtExecute()+255<-kxfxsExecute() 
+ +218<-kxfxsp()+821<-kxfxmai()+588 
+     
+ <-kxfprdp()+1721<-opirip()+875<-opidrv()+666<-sou2o()+130<-opimai_real()+189<- 
+ ssthrdmain()+412<-main()+262 
+     <-__libc_start_main()+253 
+ 
+ ```
+ 
+  Top FG events shows order of 10^9 waits on this event "latch: cache buffers chains".                                                                       
+               
+```			   
+					 EVENT (C)                                                         TOTAL WAITS 
+					   TIME(s)  AVG_MS  PCT                    WAS 
+					 latch: cache buffers chains                                         1.152E+09 
+					   4220800     4.1   73                   Con 
+					 DB CPU                                                                         
+						796912           14                       
+					 write complete waits                                                   357167 
+						261199   716.2    5                 Confi 
+					 cursor: pin S wait on X                                                485792 
+						235128   480.6    4                   Con 
+					 IPC send completion sync                                             30738837 
+						231228     7.8    4  
+```
+
+ This blocker statedump also shows many waiters: 
+
+``` 
+ (latch info) hold_bits=0x0 ud_influx=0x2afdea5 
+       Waiting For: 
+         0x68a4cb348 Child 'cache buffers chains' (level=1, SGA latch, 
+ child#=80333) 
+         Holder Location: kcb2.h LINE:4478 ID:kcbgtcr: slow path excl: 
+         Holder Context: 0 
+         Waiter Location: kcb2.h LINE:4478 ID:kcbgtcr: slow path excl: 
+         Waiter Context: 1935488 
+         Latch State: 
+           state=busy (exclusive) [value=0x100000000000005e] 
+           holder orapid=94, ospid=11146 
+           wlstate=free [value=0] 
+                    waiters [orapid (seconds since: put on list, posted, alive 
+ check)]: 
+             120 (0, -1, 0) 
+             89 (0, *, 0) 
+             117 (0, *, 0) 
+             75 (0, *, 0) 
+             116 (0, *, 0) 
+             92 (0, *, 0) 
+             133 (0, *, 0) 
+             77 (0, *, 0) 
+             81 (0, *, 0) 
+             137 (0, *, 0) 
+             124 (0, *, 0) 
+             118 (0, *, 0) 
+             87 (0, *, 0) 
+             145 (0, *, 0) 
+             136 (0, *, 0) 
+             105 (0, *, 0) 
+             82 (0, *, 0) 
+             126 (0, *, 0) 
+             98 (0, *, 0) 
+             143 (0, *, 0) 
+             140 (0, *, 0) 
+             84 (0, *, 0) 
+             104 (0, *, 0) 
+             122 (0, *, 0) 
+             86 (0, *, 0) 
+             111 (0, *, 0) 
+             113 (0, *, 0) 
+             103 (0, *, 0) 
+             131 (0, *, 0) 
+             109 (0, *, 0) 
+             91 (0, *, 0) 
+             97 (0, *, 0) 
+             129 (0, *, 0) 
+             93 (0, *, 0) 
+             78 (0, *, 0) 
+             121 (0, *, 0) 
+             72 (0, *, 0) 
+             83 (0, *, 0) 
+             107 (0, *, 0) 
+             125 (0, *, 0) 
+             85 (0, *, 0) 
+             79 (0, *, 0) 
+             101 (0, *, 0) 
+             123 (0, *, 0) 
+             141 (0, *, 0) 
+             137 (0, *, 0) 
+             81 (0, *, 0) 
+             waiter count=75 
+           gotten 3802645670 times wait, failed first 2153394050 sleeps 
+ 478430440 
+           gotten 8027688 times nowait, failed 79036830, consecutive readers 0 
+       On Wait List For: 0x68a4cb348 
+       Waiter Link: [0x6949766d8,0x69ca36898] 
+     Process Group: DEFAULT, pseudo proc: 0x694a547b0 
+     O/S info: user: kpadmana, term: UNKNOWN, ospid: 11190 
+	 
+```
+	 
+ pstack of blocked and blocker PID seems to be held while getting CR block  on  kcbgtcr 
+ 
+ pstack of blocked slave: 
+ 
+```
+ 
+ bash-4.1$ pstack 11100 
+ #0  0x0000003fed8eb197 in semop () from /lib64/libc.so.6 
+ #1  0x0000000010945b36 in sskgpwwait () 
+ #2  0x00000000109436e8 in skgpwwait () 
+ #3  0x0000000000cd4ab2 in kslgess () 
+ #4  0x000000001053f3bd in ksl_get_shared_latch_int () 
+ #5  0x0000000007fb9d91 in kcbso1 () 
+ #6  0x0000000007fbe7d1 in kcbpsod () 
+ #7  0x000000000142b055 in kcbgtcr () 
+ #8  0x00000000105c998a in ktecgetsh () 
+ #9  0x00000000105c90a1 in ktecgshx () 
+ #10 0x0000000001578074 in kteinicnt1 () 
+ #11 0x000000000365b1de in qertbFetch () 
+ #12 0x000000000183d3b7 in qergiFetch () 
+ #13 0x000000000364ddf1 in qervwFetch () 
+ #14 0x0000000001846085 in qertqoFetch () 
+ #15 0x0000000001831789 in qerpxSlaveFetch () 
+ #16 0x000000000182ff1c in qerpxFetch () 
+ #17 0x0000000001d6d6c2 in opiexe () 
+ #18 0x00000000026b9ba3 in kpoal8 () 
+ #19 0x00000000106ea330 in opiodr () 
+ #20 0x00000000038162c5 in kpoodr () 
+ #21 0x00000000108d94d5 in upirtrc () 
+ #22 0x00000000108b0226 in kpurcsc () 
+ #23 0x00000000108a87b1 in kpuexec () 
+ #24 0x00000000108d8829 in OCIStmtExecute () 
+ #25 0x000000000255994f in kxfxsStmtExecute () 
+ #26 0x000000000255912a in kxfxsExecute () 
+ #27 0x0000000002552a65 in kxfxsp () 
+ #28 0x000000000255066c in kxfxmai () 
+ #29 0x000000000259c319 in kxfprdp () 
+ #30 0x00000000037f5efb in opirip () 
+ #31 0x0000000001d4933a in opidrv () 
+ #32 0x0000000002a7e0e2 in sou2o () 
+ #33 0x0000000000c6c63d in opimai_real () 
+ #34 0x0000000002a88e3c in ssthrdmain () 
+ #35 0x0000000000c6c556 in main () 
+ . 
+ pstack of blocker: 
+ bash-4.1$ pstack 11190 
+ #0  0x0000003fed8eb197 in semop () from /lib64/libc.so.6 
+ #1  0x0000000010945b36 in sskgpwwait () 
+ #2  0x00000000109436e8 in skgpwwait () 
+ #3  0x0000000000cd4ab2 in kslgess () 
+ #4  0x000000000141fe94 in kcbgtcr () 
+ #5  0x00000000105c998a in ktecgetsh () 
+ #6  0x00000000105c90a1 in ktecgshx () 
+ #7  0x000000000157bb93 in kteinmap0 () 
+ #8  0x000000000157b2f8 in kteinmap () 
+ #9  0x0000000003116884 in kdselget () 
+ #10 0x0000000003116273 in kdstsne () 
+ #11 0x000000001080ba94 in kdstsnb () 
+ #12 0x0000000003124659 in kdst_fetch0 () 
+ #13 0x0000000003143ac0 in kdstf00001010000100km () 
+ #14 0x0000000003122086 in kdsttgr () 
+ #15 0x000000000365ec40 in qertbFetch () 
+ #16 0x000000000183d3b7 in qergiFetch () 
+ #17 0x000000000364ddf1 in qervwFetch () 
+ #18 0x0000000001846085 in qertqoFetch () 
+ #19 0x0000000001831789 in qerpxSlaveFetch () 
+ #20 0x000000000182ff1c in qerpxFetch () 
+ #21 0x0000000001d6d6c2 in opiexe () 
+ #22 0x00000000026b9ba3 in kpoal8 () 
+ #23 0x00000000106ea330 in opiodr () 
+ #24 0x00000000038162c5 in kpoodr () 
+ #25 0x00000000108d94d5 in upirtrc () 
+ #26 0x00000000108b0226 in kpurcsc () 
+ #27 0x00000000108a87b1 in kpuexec () 
+ #28 0x00000000108d8829 in OCIStmtExecute () 
+ #29 0x000000000255994f in kxfxsStmtExecute () 
+ #30 0x000000000255912a in kxfxsExecute () 
+ #31 0x0000000002552a65 in kxfxsp () 
+ #32 0x000000000255066c in kxfxmai () 
+ #33 0x000000000259c319 in kxfprdp () 
+ #34 0x00000000037f5efb in opirip () 
+ #35 0x0000000001d4933a in opidrv () 
+ #36 0x0000000002a7e0e2 in sou2o () 
+ #37 0x0000000000c6c63d in opimai_real () 
+ #38 0x0000000002a88e3c in ssthrdmain () 
+ #39 0x0000000000c6c556 in main ()       
+
+```
+ I found the problematic seg header and it is a temp block.  Dumping the 
+ buffer globally, there are close to 40 CR copies and only on this instance 2, 
+ which explains the hash latch contention, but they are all in a weird state: 
+
+ - they are all in CR state but pinned in KCBMEXCL mode and the pinner are 
+ asking for KCBMCR mode. 
+ 
+ - most of them have KCBBHFCR "reading_as_CR" flag set, but globally dump the 
+ buffer there are no other buffer/lock out there so shouldn't really go 
+ through this path. One suspicion is it is set by CR by pass feature. 
+ 
+ - all buffers I found in the SSD are "corrupt" with rdba, scn, seq, flg set 
+ to 0.  But type/format/chkval are there.  So there are about 24 bytes of 
+ cache header gets wiped out.                
+ 
+ I conclude my discussion on the hang analysis here.
+ 
+ </xmp>
+
+<script src="http://cdn.ztx.io/strapdown/strapdown.min.js"></script> 
+</html>
+ 

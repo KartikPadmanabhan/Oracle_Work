@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html>
+<title> DEBUGGING KERNEL MEMORY LEAKS IN ORACLE RDBMS </title>
+
+<xmp theme="chaltin" style="display:none;">
+
+
+#### Author: Kartik Padmanabhan, Architect, Oracle USA Inc
+
+This material is aimed for seasoned DBA architects and kernel engineers working with Oracle RDBMS who are interested in kernel memory leaks in Oracle Database. The focus of discussion of this discussion will be on 12c hang infrastructure, however its applicable to older releases as well. 
+
+Here is the simple script that I use internally to triage memory leaks:
+
+```
+			define m_string_length = 200
+			 
+			drop table t1 purge;
+			create table t1(v1 varchar2( &m_string_length ));
+			 
+			create or replace procedure p1 (
+				i_rowcount  in number   default 1000000,
+				i_bulk_pause    in number   default 0,
+				i_forall_pause  in number   default 0,
+				i_free_pause    in number   default 0
+			)
+			as
+			 
+				type w_type is table of varchar2( &m_string_length );
+				w_list      w_type := w_type();
+				w_free      w_type := w_type();
+			 
+			begin
+				for i in 1..i_rowcount loop
+					w_list.extend;
+					w_list(i) := rpad('x', &m_string_length );
+				end loop;
+			 
+				dbms_lock.sleep(i_bulk_pause);
+			 
+				forall i in 1..w_list.count
+				insert into t1 values(w_list(i));
+			 
+				dbms_lock.sleep(i_forall_pause);
+			 
+				commit;
+			 
+				w_list := w_free;
+				dbms_session.free_unused_user_memory;
+			 
+				dbms_lock.sleep(i_free_pause);
+			 
+			end;
+			/
+```
+
+If you want to monitor the session usage we run the following script
+
+```
+			rem
+			rem     Simple script to check memory usage for a given SID
+			rem     Last tested
+			rem             10.2.0.3
+			rem
+			 
+			define m_sid = &1
+			 
+			column name format a40
+			 
+			column  value       format  999,999,999,999
+			 
+			column  category    format  a10
+			column  allocated   format  999,999,999,999
+			column  used        format  999,999,999,999
+			column  max_allocated   format  999,999,999,999
+			 
+			column  pga_used_mem        format  999,999,999,999
+			column  pga_alloc_mem       format  999,999,999,999
+			column  pga_freeable_mem    format  999,999,999,999
+			column  pga_max_mem     format  999,999,999,999
+			 
+			select
+				name, value
+			from
+				v$sesstat ss,
+				v$statname sn
+			where
+				sn.name like '%ga memory%'
+			and ss.statistic# = sn.statistic#
+			and ss.sid = &m_sid
+			;
+			 
+			select
+				category,
+				allocated,
+				used,
+				max_allocated
+			from
+				v$process_memory
+			where
+				pid = (
+					select  pid
+					from    v$process
+					where
+						addr = (
+							select  paddr
+							from    V$session
+							where   sid = &m_sid
+						)
+					)
+			;
+			 
+			select
+				pga_used_mem,
+				pga_alloc_mem,
+				pga_freeable_mem,
+				pga_max_mem
+			from
+				v$process
+			where
+				addr = (
+					select  paddr
+					from    V$session
+					where   sid = &m_sid
+				)
+			;
+
+```
+The figures I’m after are just the session and process memory from v\$sesstat, and the two different ways of reporting process memory from v\$process and v\$process_memory. These are the results I got on a database running 12.2.0.1. The set immediately below reports the state of PGA memory just after after the creation of the array, the set of results further down the page reports the same information just after the call to the procedure has ended.
+
+```
+			NAME                                                VALUE
+			---------------------------------------- ----------------
+			session uga memory                                221,824
+			session uga memory max                            221,824
+			session pga memory                            313,843,284
+			session pga memory max                        313,843,284
+			 
+			CATEGORY          ALLOCATED             USED    MAX_ALLOCATED
+			---------- ---------------- ---------------- ----------------
+			SQL                   1,008              104           55,276
+			PL/SQL               22,412           17,848           22,412
+			Other           627,269,497                       627,269,497
+			 
+				PGA_USED_MEM    PGA_ALLOC_MEM PGA_FREEABLE_MEM      PGA_MAX_MEM
+			---------------- ---------------- ---------------- ----------------
+				 235,870,025      627,292,917                0      627,292,917
+```
+We’ll notice several key points.
+
+First (obviously) v\$sesstat tells use that we’ve used a lot of memory – which isn’t too surprising since we generated 1,000,000 character strings of length 200, so we know we’re going to see at least a couple of hundred megabytes of RAM being used.
+
+But there’s much more to see in these three result sets. The report from v\$process_memory says we’ve allocated more than 600MB in the “Other” category – which is a little surprising since (a) we know that we’ve used the memory for a pl/sql array – so why is it in “Other” – and (b) it’s twice as much memory as reported in v\$sesstat and (c) we don’t see any of it in the “Used” column.
+
+In fact, a dump of the pga and uga heaps (oradebug dump heapdump 5) shows that we have 313mb of RAM in the pga heap, of which 77MB is marked as free (but not yet released from the heap). From this we we can probably infer that the code maintaining v\$process_memory is broken. I suspect that we really ought to see that 313MB should in both the “Allocated” and “Used” columns with, quite possibly, that 77MB appearing in a separate row (not visible in this report) for the category “Freeable”.
+
+Note that the report from v$process is closer to the actual state given by the heap dump. It shows pga_used_mem at 236M – which means that the 77M free from the heap dump is correctly subtracted from the 313MB total, but possibly that 77MB should be reported as “PGA_Freeable_Mem”, rather than disappearing completely. This view still has a problem, though: the pga_alloc_mem and pga_max_mem are both displaying the same doubling effect as v\$process_memory.
+
+Bottom line: v$sesstat seems to show you most of the truth, with v\$process helping you to seperate the freeable memory out from the currently allocated memory, but both v\$process and v\$process_memory are not to be trusted. (Some of these anomalies are still present in 11.1.0.6 by the way).
+
+Debugging memory leaks is a very extensive process and usually done by very experiences kernel engineers. I am not intending to teach the basics of memory leaks, but giving some real scenarios where I have approached in the past.
+
+The next bit of output shows you the report results after the procedure call had completed:
+
+```
+			NAME                                                VALUE
+			---------------------------------------- ----------------
+			session uga memory                            498,681,064
+			session uga memory max                        498,681,064
+			session pga memory                            598,662,740
+			session pga memory max                        911,924,820
+			 
+			CATEGORY          ALLOCATED             USED    MAX_ALLOCATED
+			---------- ---------------- ---------------- ----------------
+			SQL                   3,024              516           55,276
+			PL/SQL          488,711,516        4,222,224      488,711,516
+			Other           110,135,753                       736,607,661
+			 
+				PGA_USED_MEM    PGA_ALLOC_MEM PGA_FREEABLE_MEM      PGA_MAX_MEM
+			---------------- ---------------- ---------------- ----------------
+				 498,885,505      598,850,293                0    1,225,374,453
+```
+ The session has allocated – and is still holding – more than 488MB in the PL/SQL category just because of that one million row insert. (My client was processing 3.8 million rows, and they “lost” 7.7GB of memory to this operation – the memory loss gives the appearance of growing geometrically with the number of rows).
+
+In fact the penalty is more than that 488MB; the memory that had been allocated for the bulk collect in category “Other” has been released and the 110MB still remaining in that categiry is also a side effect of the forall insert.
+
+Note, by the way, that the pga_max_mem from v$process_memory is still 313M higher than it should be, as is the max_allocated in the “Other” category in v\$process_memory.
+
+So if your code does very large “forall insert” calls and you see Oracle error ORA-04030 from time to time, or workarea operations dumping to disc unexpectedly, you may temporarily be losing large amounts of memory to this bug – in which case check Metalink for the bug number and see if there’s a patch that’s good for your platform. (And if you’re on 10.2.0.3 or 10.2.0.4 and there isn’t a patch for your platform yet, there’s a reasonable chance you can get one created since it’s already been done on a couple of other platforms.)
+
+I am also summarizing below a list of cases where I have seen memory leak in the past and the way I have approached the problem.
+
+### ORA-04030 AND HUGE ALLOCATION REQUEST FROM "KLLCQGF:KLLSLTBA" 
+
+I have seen this in case of partition spilling code where creating millions of rows in dynamic partitioning views spills memory. Here is an example:
+
+```
+		create table bugtable partition by range(BSNSS_UNIT_ID) 
+		interval(100) 
+		subpartition by hash(PYMNT_SPNSR_ID) 
+		subpartitions 32 
+		(partition p0 values less than (438947))  2    3    4    5  nologging as 
+		Select * from scott.bsnss_acfs; 
+		create table bugtable partition by range(BSNSS_UNIT_ID) 
+		 
+		ERROR at line 1: 
+		ORA-04030: out of process memory when trying to allocate 266264 bytes 
+		(klcliti:kghds,kllcqgf:kllsltba) 
+ 
+```
+ 
+Looking at the top 10 memory users in the foreground tracefile that crashed, I observed the following.
+
+```
+		 *** 2011-02-16 22:16:08.926 
+		 79%   12 GB, 49377 chunks: "kllcqgf:kllsltba          "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+		 14% 2255 MB, 45373 chunks: "free memory               "   
+				  top call heap   ds=0xae8bb40  dsprt=(nil) 
+		  2%  283 MB, 49379 chunks: "kllcqc:kllcqslt           "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+		  1%  193 MB, 49378 chunks: "kdobjrbb                  "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+		  1%  184 MB, 3839 chunks: "permanent memory          "   
+				  kksgaAlloc      ds=0x2ab13a2a0d40  dsprt=0x2ab13a35bd38 
+		  1%   96 MB,   9 chunks: "permanent memory          "   
+				  kggec.c.kggfa   ds=0x2ab13a35b7b0  dsprt=0x2ab13a35bd38 
+		  0%   58 MB, 22047 chunks: "permanent memory          "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+		  0%   55 MB, 49378 chunks: "ktbbhs:kdbh               "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+		  0%   50 MB, 49378 chunks: "kcblinlm                  "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+		  0%   22 MB, 49379 chunks: "kcbl_structure_instance   "   
+				  klcliti:kghds   ds=0x2ab13a35bd38  dsprt=0xae8ac40 
+ 
+```
+ 
+ As we can see above the chunk "kllcqgf:kllsltba" consumed more than 12GB of PGA memory and is spilling.
+ 
+### "IPQ IPC CONTEXT" ALLOCATIONS LEADING TO ORA-600 [723] SPACE LEAK 
+
+ We encountered the following space leak while running an important benchmark for a banking corporation.
+ 
+ ```
+			 Thu Jul 18 18:53:46 2013 
+			 Errors in file 
+			 /ade/b/4254404733/oracle/log/diag/rdbms/buick/buick_2/trace/buick_2_ora_8914.t 
+			 rc  (incident=48001): 
+			 ORA-00600: internal error code, arguments: [723], [134408], [1641200], 
+			 [memory leak], [], [], [], [], [], [], [], [] 
+			 ORA-03135: connection lost contact 
+			 Incident details in: 
+			 /ade/b/4254404733/oracle/log/diag/rdbms/buick/buick_2/incident/incdir_48001/bu 
+			 ick_2_ora_8914_i48001.trc 
+			 Use ADRCI or Support Workbench to package the incident. 
+			 See Note 411.1 at My Oracle Support for error and packaging details. 
+ ```
+ 
+  Top memory usage reports approx 2K freeable allocations on "IPQ IPC context"   
+ 
+ ```
+ ----- Beginning of Customized Incident Dump(s) ----- 
+ ******** ERROR: PGA memory leak detected 1641200 > 134408 ******** 
+ ======================================== 
+ SUMMARIZED MEMORY USAGE FOR THIS PROCESS 
+ ---------------------------------------- 
+  34083272 bytes, 901 chunks: "free memory               "           pga heap   
+       ds=0x2b39134a1d00  dsprt=(nil) 
+  17230072 bytes, 242 chunks: "free memory               "           top uga 
+ heap    ds=0x2b39134a7e80  dsprt=(nil) 
+   1641200 bytes,1865 chunks: "IPQ IPC context           "           pga heap   
+       ds=0x2b39134a1d00  dsprt=(nil) 
+   1264848 bytes, 117 chunks: "permanent memory          "           pga heap   
+       ds=0x2b39134a1d00  dsprt=(nil) 
+     63776 bytes,   1 chunk : "free memory               "           top call 
+ heap   ds=0x2b39134a7c60  dsprt=(nil) 
+      1736 bytes,   2 chunks: "permanent memory          "           top call 
+ heap   ds=0x2b39134a7c60  dsprt=(nil) 
+        88 bytes,   1 chunk : "permanent memory          "           top uga 
+ heap    ds=0x2b39134a7e80  dsprt=(nil) 
+ ```
+ 
+The heap dump shows the leak originated from unallocated freeable chunks   originated from  "IPQ IPC context". 
+
+```
+ HEAP DUMP heap name="pga heap"  desc=0x2b39134a1d00 
+  extent sz=0x20c0 alt=232 het=32767 rec=0 flg=3 opc=3 
+  parent=(nil) owner=(nil) nex=(nil) xsz=0x2fff0 heap=(nil) 
+  fl2=0x60, nex=(nil), dsxvers=1, dsxflg=0x0 
+  dsx first ext=0x2b39136c9b60 
+  pdb id=0 
+ EXTENT 0 addr=0x2b391798b010 
+   Chunk     2b391798b020 sz=      416    free "               " 
+   Chunk     2b391798b1c0 sz=      880    freeable  "IPQ IPC context" 
+ ```
+ 
+The freeable chunks with the allocation comments "IPQ IPC context" in the  heap-dump represents leak. 
+
+```
+  1641200 bytes,1865 chunks: "IPQ IPC context           " 
+            pga heap        ds=0x2b39134a1d00  dsprt=(nil) 
+```
+ 
+### MEMORY LEAK IN KDMR SUBHEAP DURING KDMRALLOCSGATAS ALLOCATIONS 
+
+Here is a symptom that we notice when this happens
+
+```
+			 Sun Feb 23 01:31:16 2014 
+			 Errors in file 
+			 /net/slcab000/scratch/kpadmana/diag/diag/rdbms/rumba/rumba_1/trace/rumba_1_ora 
+			 _18977.trc 
+			 (incident=5281) (PDBNAME=SPDB2): 
+			 ORA-04031: unable to allocate 4072 bytes of shared memory ("shared 
+			 pool","BJI_SP_02","pacdHds_kkpaco","kksgaAlloc: firstN") 
+			 Incident details in: 
+			 /net/slcab000/scratch/kpadmana/diag/diag/rdbms/rumba/rumba_1/incident/incdir_5 
+			 281/rumba_1_ora_18977_i5281.trc 
+			 Use ADRCI or Support Workbench to package the incident. 
+			 See Note 411.1 at My Oracle Support for error and packaging details. 
+``` 
+
+ By far, the biggest allocation is "KDMR subheap": 
+ 
+```
+			 TOP 10 MEMORY USES FOR SGA HEAP SUB POOL 1 
+			 ---------------------------------------------- 
+			 "KDMR subheap              "        552 MB 48% 
+			 "SQLA                      "        178 MB 15% 
+			 "free memory               "         72 MB  6% 
+			 ... 
+			 . 
+			 TOP 10 MEMORY USES FOR SGA HEAP SUB POOL 2 
+			 ---------------------------------------------- 
+			 "KDMR subheap              "        580 MB 48% 
+			 "keomg: entry list         "        196 MB 16% 
+			 "keomg: entry list         "         92 MB  8% 
+			 . 
+			 TOP 20 MEMORY USES ACROSS SGA HEAP 1 - 6 
+			 ---------------------------------------------- 
+			 "KDMR subheap              "       3461 MB 52% 
+			 "SQLA                      "        624 MB  9% 
+			 "free memory               "        525 MB  8% 
+			 "PX subheap                "        520 MB  8% 
+5 LARGEST SUB HEAPS for heap name="sga heap(1,0)"   desc=0x6005fdb0 
+   Subheap ds=0x60032ca0  heap name=    KDMR subheap  size=      3651335400 
+    owner=(nil)  latch=(nil) 
+ 
+```
+
+ 
+ It looks like the subheap has extents from all six shared pool subpools. 
+ 
+ The typical extent in the "KDMR subheap" appears to be: 
+ 
+```
+			 EXTENT 910059 addr=0x60efd3be0 
+			   Chunk        60efd3bf0 sz=     1712    free      "               " 
+			   Chunk        60efd42a0 sz=      104    freeable  "kdmrAddToSGATas" 
+			   Chunk        60efd4308 sz=     2328    freeable  "kdmrAllocSGATas" 
+```
+
+ In addition almost all the extents did not free kdmrAddToSGATas/kdmrAllocSGATas allocations. The extents in subheap 910059 did not free kdmrAddToSGATas/kdmrAllocSGATas 
+ allocations.
+
+ Questions?
+
+ 
+
+ </xmp>
+
+<script src="http://cdn.ztx.io/strapdown/strapdown.min.js"></script> 
+</html>
+ 
