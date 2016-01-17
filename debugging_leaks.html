@@ -149,7 +149,7 @@ We'll notice several key points.
 
 First (obviously) v$sesstat tells use that we've used a lot of memory  which isn't too surprising since we generated 1,000,000 character strings of length 200, so we know we're going to see at least a couple of hundred megabytes of RAM being used.
 
-But there's much more to see in these three result sets. The report from v\$process_memory says we've allocated more than 600MB in the "Other" category  which is a little surprising since (a) we know that we've used the memory for a pl/sql array – so why is it in "Other" – and (b) it's twice as much memory as reported in v\$sesstat and (c) we don't see any of it in the "Used" column.
+But there's much more to see in these three result sets. The report from v\$process_memory says we've allocated more than 600MB in the "Other" category  which is a little surprising since (a) we know that we've used the memory for a pl/sql array - so why is it in "Other" - and (b) it's twice as much memory as reported in v\$sesstat and (c) we don't see any of it in the "Used" column.
 
 In fact, a dump of the pga and uga heaps (oradebug dump heapdump 5) shows that we have 313mb of RAM in the pga heap, of which 77MB is marked as free (but not yet released from the heap). From this we we can probably infer that the code maintaining v\$process_memory is broken. I suspect that we really ought to see that 313MB should in both the heapdump report for the category "Freeable".
 
